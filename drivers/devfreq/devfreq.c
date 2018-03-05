@@ -610,7 +610,7 @@ struct devfreq *devm_devfreq_add_device(struct device *dev,
 	devfreq = devfreq_add_device(dev, profile, governor_name, data);
 	if (IS_ERR(devfreq)) {
 		devres_free(ptr);
-		return ERR_PTR(-ENOMEM);
+		return devfreq;
 	}
 
 	*ptr = devfreq;
@@ -816,12 +816,12 @@ static ssize_t governor_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 
 	/* Governor white list */
-	if (strncmp(str_governor, "bw_hwmon", DEVFREQ_NAME_LEN) &&
-		strncmp(str_governor, "cpufreq", DEVFREQ_NAME_LEN) &&
+	if (strncmp(str_governor, "cpufreq", DEVFREQ_NAME_LEN) &&
+		strncmp(str_governor, "msm-adreno-tz", DEVFREQ_NAME_LEN) &&
 		strncmp(str_governor, "performance", DEVFREQ_NAME_LEN) &&
 		strncmp(str_governor, "powersave", DEVFREQ_NAME_LEN) &&
-		strncmp(str_governor, "mem_latency", DEVFREQ_NAME_LEN) &&
-		strncmp(str_governor, "msm-adreno-tz", DEVFREQ_NAME_LEN))
+		strncmp(str_governor, "simple_ondemand", DEVFREQ_NAME_LEN) &&
+		strncmp(str_governor, "userspace", DEVFREQ_NAME_LEN))
 		return -EINVAL;
 
 	mutex_lock(&devfreq_list_lock);
