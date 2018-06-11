@@ -26,7 +26,6 @@
 #include <linux/uaccess.h>
 #include <linux/msm-bus.h>
 #include <linux/pm_qos.h>
-#include <linux/lcd_notify.h>
 
 #include "mdss.h"
 #include "mdss_panel.h"
@@ -38,10 +37,6 @@
 
 #define XO_CLK_RATE	19200000
 #define CMDLINE_DSI_CTL_NUM_STRING_LEN 2
-
-#ifdef CONFIG_STATE_NOTIFIER
-#include <linux/state_notifier.h>
-#endif
 
 /* Master structure to hold all the information about the DSI/panel */
 static struct mdss_dsi_data *mdss_dsi_res;
@@ -358,6 +353,7 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 		pr_err("%s: Invalid input data\n", __func__);
 		return -EINVAL;
 	}
+
 	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
@@ -458,7 +454,7 @@ static int mdss_dsi_panel_power_ulp(struct mdss_panel_data *pdata,
 int mdss_dsi_panel_power_ctrl(struct mdss_panel_data *pdata,
 	int power_state)
 {
-	int ret = 0;
+	int ret;
 	struct mdss_panel_info *pinfo;
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
 
@@ -1761,8 +1757,7 @@ static int mdss_dsi_blank(struct mdss_panel_data *pdata, int power_state)
 			ATRACE_BEGIN("dsi_panel_off");
 			ret = ctrl_pdata->off(pdata);
 			if (ret) {
-				pr_err("%s: Panel OFF failed\n",
-					__func__);
+				pr_err("%s: Panel OFF failed\n", __func__);
 				goto error;
 			}
 			ATRACE_END("dsi_panel_off");
@@ -1816,6 +1811,81 @@ static irqreturn_t test_hw_vsync_handler(int irq, void *data)
 	if (pdata->next)
 		complete_all(&pdata->next->te_done);
 	return IRQ_HANDLED;
+}
+
+static int mdss_dsi_disp_wake_thread(void *data)
+{
+	struct mdss_panel_data *pdata = data;
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata =
+		container_of(pdata, typeof(*ctrl_pdata), panel_data);
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+
+	sched_setscheduler(current, SCHED_FIFO, &param);
+
+	wait_event(ctrl_pdata->wake_waitq,
+		atomic_read(&ctrl_pdata->needs_wake));
+
+	/* MDSS_EVENT_LINK_READY */
+	if (ctrl_pdata->refresh_clk_rate)
+		mdss_dsi_clk_refresh(pdata, ctrl_pdata->update_phy_timing);
+	mdss_dsi_on(pdata);
+
+	/* MDSS_EVENT_UNBLANK */
+	mdss_dsi_unblank(pdata);
+
+	/* MDSS_EVENT_PANEL_ON */
+	ctrl_pdata->ctrl_state |= CTRL_STATE_MDP_ACTIVE;
+	pdata->panel_info.esd_rdy = true;
+
+	atomic_set(&ctrl_pdata->needs_wake, 0);
+	complete_all(&ctrl_pdata->wake_comp);
+
+	return 0;
+}
+
+static void mdss_dsi_start_wake_thread(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	if (ctrl_pdata->wake_thread)
+		return;
+
+	ctrl_pdata->wake_thread = kthread_run(mdss_dsi_disp_wake_thread,
+						&ctrl_pdata->panel_data,
+						"mdss_disp_wake");
+	if (IS_ERR(ctrl_pdata->wake_thread)) {
+		pr_err("%s: Failed to start disp-wake thread, rc=%ld\n",
+				__func__, PTR_ERR(ctrl_pdata->wake_thread));
+		ctrl_pdata->wake_thread = NULL;
+	}
+}
+
+static void mdss_dsi_display_wake(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	if (atomic_read(&ctrl_pdata->disp_is_on))
+		return;
+ 	atomic_set(&ctrl_pdata->disp_is_on, 1);
+	reinit_completion(&ctrl_pdata->wake_comp);
+ 	/* Make sure the thread is started since it's needed right now */
+	mdss_dsi_start_wake_thread(ctrl_pdata);
+	ctrl_pdata->wake_thread = NULL;
+ 	atomic_set(&ctrl_pdata->needs_wake, 1);
+	wake_up(&ctrl_pdata->wake_waitq);
+}
+
+static int mdss_dsi_fb_unblank_cb(struct notifier_block *nb,
+	unsigned long action, void *data)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata =
+		container_of(nb, typeof(*ctrl_pdata), wake_notif);
+	struct fb_event *evdata = data;
+	int *blank = evdata->data;
+ 	/* Parse framebuffer blank events as soon as they occur */
+	if (action != FB_EARLY_EVENT_BLANK)
+		return NOTIFY_OK;
+ 	if (*blank == FB_BLANK_UNBLANK)
+		mdss_dsi_display_wake(ctrl_pdata);
+	else
+		mdss_dsi_start_wake_thread(ctrl_pdata);
+ 	return NOTIFY_OK;
 }
 
 int mdss_dsi_cont_splash_on(struct mdss_panel_data *pdata)
@@ -2689,37 +2759,13 @@ static int mdss_dsi_event_handler(struct mdss_panel_data *pdata,
 		ctrl_pdata->refresh_clk_rate = true;
 		break;
 	case MDSS_EVENT_LINK_READY:
-		if (ctrl_pdata->refresh_clk_rate)
-			rc = mdss_dsi_clk_refresh(pdata,
-				ctrl_pdata->update_phy_timing);
-
-		rc = mdss_dsi_on(pdata);
-		mdss_dsi_op_mode_config(pdata->panel_info.mipi.mode,
-							pdata);
-		break;
-	case MDSS_EVENT_UNBLANK:
-		lcd_notifier_call_chain(LCD_EVENT_ON_START, NULL);
-
-		if (ctrl_pdata->on_cmds.link_state == DSI_LP_MODE)
-			rc = mdss_dsi_unblank(pdata);
+		/* The unblank notifier handles waking for unblank events */
+		mdss_dsi_display_wake(ctrl_pdata);
 		break;
 	case MDSS_EVENT_POST_PANEL_ON:
 		rc = mdss_dsi_post_panel_on(pdata);
 		break;
-	case MDSS_EVENT_PANEL_ON:
-#ifdef CONFIG_STATE_NOTIFIER
-		state_resume();
-#endif
-		ctrl_pdata->ctrl_state |= CTRL_STATE_MDP_ACTIVE;
-		if (ctrl_pdata->on_cmds.link_state == DSI_HS_MODE)
-			rc = mdss_dsi_unblank(pdata);
-		pdata->panel_info.esd_rdy = true;
-#ifdef CONFIG_STATE_NOTIFIER
-		state_resume();
-#endif
-		break;
 	case MDSS_EVENT_BLANK:
-		lcd_notifier_call_chain(LCD_EVENT_OFF_START, NULL);
 		power_state = (int) (unsigned long) arg;
 		if (ctrl_pdata->off_cmds.link_state == DSI_HS_MODE)
 			rc = mdss_dsi_blank(pdata, power_state);
@@ -2731,9 +2777,7 @@ static int mdss_dsi_event_handler(struct mdss_panel_data *pdata,
 		if (ctrl_pdata->off_cmds.link_state == DSI_LP_MODE)
 			rc = mdss_dsi_blank(pdata, power_state);
 		rc = mdss_dsi_off(pdata, power_state);
-#ifdef CONFIG_STATE_NOTIFIER
-		state_suspend();
-#endif
+		atomic_set(&ctrl_pdata->disp_is_on, 0);
 		break;
 	case MDSS_EVENT_CONT_SPLASH_FINISH:
 		if (ctrl_pdata->off_cmds.link_state == DSI_LP_MODE)
@@ -3263,7 +3307,6 @@ static int mdss_dsi_ctrl_probe(struct platform_device *pdev)
 	struct mdss_util_intf *util;
 	static int te_irq_registered;
 	struct mdss_panel_data *pdata;
-	struct mdss_panel_cfg *pan_cfg = NULL;
 
 	if (!pdev || !pdev->dev.of_node) {
 		pr_err("%s: pdev not found for DSI controller\n", __func__);
@@ -3293,14 +3336,6 @@ static int mdss_dsi_ctrl_probe(struct platform_device *pdev)
 	util = mdss_get_util_intf();
 	if (util == NULL) {
 		pr_err("Failed to get mdss utility functions\n");
-		return -ENODEV;
-	}
-
-	pan_cfg = util->panel_intf_type(MDSS_PANEL_INTF_SPI);
-	if (IS_ERR(pan_cfg)) {
-		return PTR_ERR(pan_cfg);
-	} else if (pan_cfg) {
-		pr_debug("%s: SPI is primary\n", __func__);
 		return -ENODEV;
 	}
 
@@ -3444,6 +3479,10 @@ static int mdss_dsi_ctrl_probe(struct platform_device *pdev)
 		ctrl_pdata->shared_data->dsi0_active = true;
 	else
 		ctrl_pdata->shared_data->dsi1_active = true;
+
+	ctrl_pdata->wake_notif.notifier_call = mdss_dsi_fb_unblank_cb;
+	ctrl_pdata->wake_notif.priority = INT_MAX - 1;
+	fb_register_client(&ctrl_pdata->wake_notif);
 
 	return 0;
 
@@ -3857,12 +3896,6 @@ static int mdss_dsi_probe(struct platform_device *pdev)
 		return -EPROBE_DEFER;
 	}
 
-	if (util->display_disabled) {
-		pr_info("%s: Display is disabled, not progressing with dsi probe\n",
-			__func__);
-		return -ENOTSUPP;
-	}
-
 	if (!pdev || !pdev->dev.of_node) {
 		pr_err("%s: DSI driver only supports device tree probe\n",
 			__func__);
@@ -3931,6 +3964,7 @@ static int mdss_dsi_ctrl_remove(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	fb_unregister_client(&ctrl_pdata->wake_notif);
 	mdss_dsi_pm_qos_remove_request(ctrl_pdata->shared_data);
 
 	if (msm_dss_config_vreg(&pdev->dev,
@@ -4230,7 +4264,6 @@ static int mdss_dsi_parse_gpio_params(struct platform_device *ctrl_pdev,
 		if (!gpio_is_valid(ctrl_pdata->disp_en_gpio))
 			pr_debug("%s:%d, Disp_en gpio not specified\n",
 					__func__, __LINE__);
-		pdata->panel_en_gpio = ctrl_pdata->disp_en_gpio;
 	}
 
 	ctrl_pdata->disp_te_gpio = of_get_named_gpio(ctrl_pdev->dev.of_node,
@@ -4439,6 +4472,9 @@ int dsi_panel_device_register(struct platform_device *ctrl_pdev,
 
 	pr_info("%s: Continuous splash %s\n", __func__,
 		pinfo->cont_splash_enabled ? "enabled" : "disabled");
+
+	init_completion(&ctrl_pdata->wake_comp);
+	init_waitqueue_head(&ctrl_pdata->wake_waitq);
 
 	rc = mdss_register_panel(ctrl_pdev, &(ctrl_pdata->panel_data));
 	if (rc) {
