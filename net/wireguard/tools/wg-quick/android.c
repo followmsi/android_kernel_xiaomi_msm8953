@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  *
  * This is a shell script written in C. It very intentionally still functions like
  * a shell script, calling out to external executables such as ip(8).
@@ -358,15 +358,18 @@ static	__attribute__((__constructor__(65535))) void load_symbols(void)
 
 static void cleanup_binder(AIBinder **binder)
 {
-	AIBinder_decStrong(*binder);
+	if (*binder)
+		AIBinder_decStrong(*binder);
 }
 static void cleanup_status(AStatus **status)
 {
-	AStatus_delete(*status);
+	if (*status)
+		AStatus_delete(*status);
 }
 static void cleanup_parcel(AParcel **parcel)
 {
-	AParcel_delete(*parcel);
+	if (*parcel)
+		AParcel_delete(*parcel);
 }
 
 #define _cleanup_status_ __attribute__((__cleanup__(cleanup_status)))
@@ -387,10 +390,10 @@ static int32_t string_array_size(char *const *array)
 	return size;
 }
 
-static const char *string_array_getter(const void *array_data, size_t index, int32_t *outlength)
+static const char *string_array_getter(const void *array_data, size_t index, int32_t *out_length)
 {
 	const char **array = (const char **)array_data;
-	*outlength = array[index] ? strlen(array[index]) : -1;
+	*out_length = array[index] ? strlen(array[index]) : -1;
 	return array[index];
 }
 
@@ -782,6 +785,7 @@ static uid_t *get_uid_list(const char *selected_applications)
 static void set_users(unsigned int netid, const char *excluded_applications)
 {
 	_cleanup_free_ uid_t *excluded_uids = get_uid_list(excluded_applications);
+	unsigned int args_per_command = 0;
 	_cleanup_free_ char *ranges = NULL;
 	char range[22];
 	uid_t start;
@@ -794,13 +798,19 @@ static void set_users(unsigned int netid, const char *excluded_applications)
 		else
 			snprintf(range, sizeof(range), "%u-%u", start, *excluded_uids - 1);
 		ranges = concat_and_free(ranges, " ", range);
+		if (++args_per_command % 18 == 0) {
+			cndc("network users add %u %s", netid, ranges);
+			free(ranges);
+			ranges = NULL;
+		}
 	}
 	if (start < 99999) {
 		snprintf(range, sizeof(range), "%u-99999", start);
 		ranges = concat_and_free(ranges, " ", range);
 	}
 
-	cndc("network users add %u %s", netid, ranges);
+	if (ranges)
+		cndc("network users add %u %s", netid, ranges);
 }
 
 static void set_dnses(unsigned int netid, const char *dnses)
